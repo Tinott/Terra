@@ -291,6 +291,15 @@ const calculerEnveloppe = (d, regles, jeu, tirage = null) => {
   const mix = connue(regles.mixite_sociale) ? regles.mixite_sociale.val : 0;
   const logts_sociaux = Math.round(logts * mix);
 
+  // Décomposition par typologie (mix standard, éditable via hypothèses)
+  const mixTypo = { T2: 0.35, T3: 0.40, T4: 0.25 };  // répartition par défaut
+  const surfTypo = { T2: 45, T3: 65, T4: 85 };        // m² SHAB indicatifs
+  const typologies = Object.keys(mixTypo).map((t) => ({
+    type: t,
+    nb: Math.round(logts * mixTypo[t]),
+    surface: surfTypo[t],
+  }));
+
   return {
     surface_parcelle: surf,
     emprise: Math.round(emprise),
@@ -301,6 +310,7 @@ const calculerEnveloppe = (d, regles, jeu, tirage = null) => {
     logts,
     logts_sociaux,
     logts_libres: logts - logts_sociaux,
+    typologies,
     places,
     recul_applique: recul,
     contrainte_active:
@@ -319,7 +329,9 @@ const bilan = (env, d, jeu, tirage = null) => {
 
   const shab_libre = env.logts_libres * g('surface_moy_logt');
   const shab_social = env.logts_sociaux * g('surface_moy_logt');
-  const pv = g('prix_vente_m2');
+  // Prix de vente : sous Monte-Carlo on prend la valeur tirée (déjà DVF-aware),
+  // sinon le DVF réel du terrain, sinon l'hypothèse.
+  const pv = tirage ? g('prix_vente_m2') : (d.prix_m2_dvf?.median || g('prix_vente_m2'));
 
   const ca_libre = shab_libre * pv;
   const ca_social = shab_social * pv * (1 - g('decote_social'));
@@ -378,6 +390,10 @@ const monteCarlo = (d, regles, jeu, N = 1500) => {
       const h = jeu[k];
       t[k] = triangulaire(h.p10 ?? h.v * 0.85, h.v, h.p90 ?? h.v * 1.15);
     });
+    // Prix de vente : si DVF réel dispo, on tire dans SA distribution (P25–médiane–P75)
+    if (d.prix_m2_dvf) {
+      t.prix_vente_m2 = triangulaire(d.prix_m2_dvf.p25, d.prix_m2_dvf.median, d.prix_m2_dvf.p75);
+    }
     // Les règles PLU incertaines sont elles aussi tirées
     t.regles = {};
     [['hauteur', regles.hauteur_max_m], ['emprise', regles.emprise_au_sol_max],
@@ -789,6 +805,33 @@ async function collecter(entree, onEtape) {
     } catch { d.sources_ko.push('Géorisques'); }
   }
 
+  /* Prix de vente réels (DVF) — médiane €/m² des appartements récents de la commune */
+  if (d.code_insee) {
+    onEtape?.('Prix de vente réels (DVF)');
+    try {
+      const dvf = await jget(`https://api.cquest.org/dvf?code_commune=${d.code_insee}`);
+      const ventes = (dvf.resultats || dvf.features || dvf || []);
+      const prixM2 = [];
+      const arr = Array.isArray(ventes) ? ventes : (ventes.resultats || []);
+      arr.forEach((v) => {
+        const p = v.valeur_fonciere ?? v.properties?.valeur_fonciere;
+        const s = v.surface_relle_bati ?? v.surface_reelle_bati ?? v.properties?.surface_reelle_bati;
+        const type = (v.type_local ?? v.properties?.type_local ?? '').toLowerCase();
+        if (p && s && s > 15 && s < 300 && /appart/.test(type)) {
+          const r = p / s;
+          if (r > 500 && r < 25000) prixM2.push(r);
+        }
+      });
+      if (prixM2.length >= 5) {
+        prixM2.sort((a, b) => a - b);
+        const med = prixM2[Math.floor(prixM2.length / 2)];
+        const p25 = prixM2[Math.floor(prixM2.length * 0.25)];
+        const p75 = prixM2[Math.floor(prixM2.length * 0.75)];
+        d.prix_m2_dvf = { median: Math.round(med), p25: Math.round(p25), p75: Math.round(p75), n: prixM2.length };
+      }
+    } catch { d.sources_ko.push('DVF'); }
+  }
+
   onEtape?.(null);
   return d;
 }
@@ -913,19 +956,41 @@ function Distribution({ mc, prix }) {
 }
 
 /* ── Ligne de bilan ─────────────────────────────────────────────────────── */
-const Ligne = ({ l, v, fort, neg, indent }) => (
-  <div className="row" style={{
-    justifyContent: 'space-between', padding: '6px 0',
-    paddingLeft: indent ? 16 : 0,
-    borderBottom: fort ? `1px solid ${C.bord}` : 'none',
-    marginTop: fort ? 4 : 0,
-  }}>
-    <span style={{ fontSize: indent ? 12 : 13, color: fort ? C.txt : (indent ? C.txt3 : C.txt2), fontWeight: fort ? 600 : 400 }}>{l}</span>
-    <span className="mono" style={{ fontSize: indent ? 12 : 13, fontWeight: fort ? 600 : 500, color: neg ? C.rouge : (fort ? C.txt : C.txt2) }}>
-      {neg ? '−' : ''}{eur(Math.abs(v))}
-    </span>
-  </div>
-);
+function Ligne({ l, v, fort, neg, indent, formule, provenance }) {
+  const [ouvert, setOuvert] = useState(false);
+  const cliquable = !!(formule || provenance);
+  return (
+    <div style={{ borderBottom: fort ? `1px solid ${C.bord}` : 'none', marginTop: fort ? 4 : 0 }}>
+      <div className="row" onClick={cliquable ? () => setOuvert((o) => !o) : undefined}
+        style={{
+          justifyContent: 'space-between', padding: '6px 0', paddingLeft: indent ? 16 : 0,
+          cursor: cliquable ? 'pointer' : 'default',
+        }}>
+        <span className="row" style={{ gap: 5, fontSize: indent ? 12 : 13, color: fort ? C.txt : (indent ? C.txt3 : C.txt2), fontWeight: fort ? 600 : 400 }}>
+          {cliquable && <span className="mono" style={{ fontSize: 9, color: C.txt3, width: 8 }}>{ouvert ? '▾' : '▸'}</span>}
+          {l}
+        </span>
+        <span className="mono" style={{ fontSize: indent ? 12 : 13, fontWeight: fort ? 600 : 500, color: neg ? C.rouge : (fort ? C.txt : C.txt2) }}>
+          {neg ? '−' : ''}{eur(Math.abs(v))}
+        </span>
+      </div>
+      {ouvert && cliquable && (
+        <div className="slidein" style={{ margin: '2px 0 8px', marginLeft: indent ? 16 : 0, padding: '10px 12px', background: C.fond, borderRadius: 5, border: `1px solid ${C.bord}` }}>
+          {formule && (
+            <div className="mono" style={{ fontSize: 11, color: C.txt2, lineHeight: 1.6, marginBottom: provenance ? 8 : 0 }}>
+              {formule}
+            </div>
+          )}
+          {provenance && (
+            <div style={{ fontSize: 11, color: C.txt3, lineHeight: 1.5 }}>
+              <span style={{ color: C.bleu }}>Source — </span>{provenance}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 /* ── Champ hypothèse : éditable, traçable, réversible ───────────────────── */
 function ChampH({ k, h, onSet, onReset }) {
@@ -1060,6 +1125,76 @@ function ChampRegle({ k, v, onSet }) {
 /* ══════════════════════════════════════════════════════════════════════════
    FICHE TERRAIN
    ══════════════════════════════════════════════════════════════════════════ */
+/* ── Plan 2D de la parcelle, tracé depuis la géométrie cadastrale ────────── */
+function PlanParcelle({ geometrie, surface, emprise }) {
+  const anneau = anneauExt(geometrie);
+  if (!anneau || anneau.length < 3) return null;
+  const pts = toXY(anneau);
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = maxX - minX || 1, h = maxY - minY || 1;
+  const pad = Math.max(w, h) * 0.08;
+  const vb = `${minX - pad} ${-(maxY + pad)} ${w + 2 * pad} ${h + 2 * pad}`;
+  const d = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${(-p[1]).toFixed(1)}`).join(' ') + ' Z';
+
+  // Dimensions approximatives du rectangle englobant
+  const largeur = Math.round(w), profondeur = Math.round(h);
+
+  return (
+    <div className="pan" style={{ padding: 18 }}>
+      <div className="row" style={{ justifyContent: 'space-between', marginBottom: 12 }}>
+        <div className="eyebrow">Forme de la parcelle</div>
+        <div className="mono" style={{ fontSize: 10, color: C.txt3 }}>cadastre IGN</div>
+      </div>
+      <div style={{ background: C.fond, borderRadius: 6, padding: 16, border: `1px solid ${C.bord}` }}>
+        <svg viewBox={vb} style={{ width: '100%', height: 220, display: 'block' }} preserveAspectRatio="xMidYMid meet">
+          <path d={d} fill="rgba(224,163,65,.12)" stroke={C.ambre} strokeWidth={Math.max(w, h) / 160} strokeLinejoin="round" />
+        </svg>
+      </div>
+      <div className="row" style={{ justifyContent: 'space-around', marginTop: 14 }}>
+        {[['Surface', `${num(surface)} m²`], ['Emprise ~', `${largeur} × ${profondeur} m`], ['Bâtissable', emprise ? `${num(emprise)} m²` : '—']].map(([l, v]) => (
+          <div key={l} style={{ textAlign: 'center' }}>
+            <div className="eyebrow" style={{ fontSize: 9, marginBottom: 4 }}>{l}</div>
+            <div className="mono" style={{ fontSize: 14, fontWeight: 600 }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ fontSize: 10.5, color: C.txt3, marginTop: 12, lineHeight: 1.5, textAlign: 'center' }}>
+        Contour réel issu du cadastre. Les dimensions sont celles du rectangle englobant (indicatives).
+      </div>
+    </div>
+  );
+}
+
+/* ── Bloc d'aide contextuelle : où trouver une donnée à saisir ───────────── */
+function Tuto({ titre, etapes, lien, lienLabel }) {
+  const [ouvert, setOuvert] = useState(false);
+  return (
+    <div style={{ marginTop: 10, border: `1px solid ${C.bleu}44`, borderRadius: 6, overflow: 'hidden' }}>
+      <div className="row" onClick={() => setOuvert((o) => !o)}
+        style={{ padding: '9px 12px', cursor: 'pointer', background: 'rgba(90,145,196,.08)', gap: 7 }}>
+        <span style={{ fontSize: 13 }}>💡</span>
+        <span className="grow" style={{ fontSize: 12, fontWeight: 500, color: C.bleu }}>{titre}</span>
+        <span className="mono" style={{ fontSize: 10, color: C.bleu }}>{ouvert ? '▾' : '▸'}</span>
+      </div>
+      {ouvert && (
+        <div className="slidein" style={{ padding: '12px 14px', fontSize: 12, lineHeight: 1.6, color: C.txt2 }}>
+          <ol style={{ margin: 0, paddingLeft: 18 }}>
+            {etapes.map((e, i) => <li key={i} style={{ marginBottom: 4 }}>{e}</li>)}
+          </ol>
+          {lien && (
+            <a href={lien} target="_blank" rel="noreferrer"
+              style={{ display: 'inline-block', marginTop: 10, color: C.ambre, fontSize: 12, fontWeight: 500, textDecoration: 'none' }}>
+              → {lienLabel || 'Ouvrir le site'}
+            </a>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Fiche({ dossier, regles, jeu, onRegles, onPrix, onRetour, onSave, sauve }) {
   const [ongl, setOngl] = useState('verdict');
   const [texteP, setTexteP] = useState('');
@@ -1288,6 +1423,17 @@ function Fiche({ dossier, regles, jeu, onRegles, onPrix, onRetour, onSave, sauve
                 La bande de constructibilité de 15,5 m (disposition commune du PLUi-H) est appliquée automatiquement à l'emprise.
                 Le texte du règlement reste utile pour la mixité sociale — collez-le plus bas si besoin.
               </div>
+              <Tuto
+                titre="Où trouver l'étiquette de ma parcelle ?"
+                etapes={[
+                  'Ouvrez le portail d\'urbanisme de Toulouse Métropole (lien ci-dessous).',
+                  'Cherchez l\'adresse de votre terrain dans la barre de recherche.',
+                  'Cliquez sur la parcelle : l\'étiquette apparaît, par exemple « UM3 15 L 50 25 ».',
+                  'Lisez les 4 valeurs dans l\'ordre HF · HV · CES · CEPT et recopiez-les ci-dessus.',
+                  'Si votre terrain est à cheval sur deux zones, saisissez celle où vous voulez construire du logement.',
+                ]}
+                lien="https://carto.toulouse-metropole.fr/portailurbanisme"
+                lienLabel="Ouvrir le portail d'urbanisme de Toulouse" />
             </div>
           ) : (
             /* ── Mode texte (PLU classiques) ── */
@@ -1387,6 +1533,35 @@ function Fiche({ dossier, regles, jeu, onRegles, onPrix, onRetour, onSave, sauve
                 )}
               </div>
 
+              {/* Décomposition par typologie — répond à "c'est quoi, un logement ?" */}
+              <div className="pan" style={{ padding: 18, marginBottom: 16 }}>
+                <div className="row" style={{ justifyContent: 'space-between', marginBottom: 12 }}>
+                  <div className="eyebrow">Décomposition des {env.logts} logements</div>
+                  <div className="mono" style={{ fontSize: 10, color: C.txt3 }}>répartition indicative</div>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
+                  {env.typologies.map((t) => (
+                    <div key={t.type} style={{ background: C.fond, borderRadius: 6, padding: 14, textAlign: 'center', border: `1px solid ${C.bord}` }}>
+                      <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: C.ambre }}>{t.nb}</div>
+                      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 2 }}>{t.type}</div>
+                      <div className="mono" style={{ fontSize: 10, color: C.txt3, marginTop: 3 }}>~{t.surface} m² chacun</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, color: C.txt3, marginTop: 12, lineHeight: 1.5 }}>
+                  Un « logement » = un appartement vendable. La répartition T2/T3/T4 est une hypothèse
+                  (35 / 40 / 25 %) modifiable. Le nombre total vient de la surface habitable ÷ surface moyenne par logement
+                  ({num(jeu.surface_moy_logt.v)} m²).
+                </div>
+              </div>
+
+              {/* Plan 2D réel de la parcelle */}
+              {dossier.geometrie && (
+                <div style={{ marginBottom: 16 }}>
+                  <PlanParcelle geometrie={dossier.geometrie} surface={env.surface_parcelle} emprise={env.emprise} />
+                </div>
+              )}
+
               <div className="pan" style={{ padding: 16 }}>
                 <div style={{ fontSize: 12, color: C.txt3, lineHeight: 1.6 }}>
                   <strong style={{ color: C.txt2 }}>Ce n'est pas un projet.</strong> C'est une enveloppe de capacité : le volume maximal théorique
@@ -1410,27 +1585,50 @@ function Fiche({ dossier, regles, jeu, onRegles, onPrix, onRetour, onSave, sauve
               <div className="pan" style={{ padding: 22 }}>
                 <div className="eyebrow" style={{ marginBottom: 14 }}>Bilan promoteur — scénario médian</div>
 
-                <Ligne l="Ventes logements libres" v={bil.ca_libre} indent />
-                {bil.ca_social > 0 && <Ligne l="Ventes logements sociaux" v={bil.ca_social} indent />}
-                {bil.ca_parking > 0 && <Ligne l="Ventes parkings" v={bil.ca_parking} indent />}
-                <Ligne l="Chiffre d'affaires" v={bil.CA} fort />
+                <Ligne l="Ventes logements libres" v={bil.ca_libre} indent
+                  formule={`${env.logts_libres} logts × ${num(jeu.surface_moy_logt.v)} m² × ${eur(dossier.prix_m2_dvf?.median || jeu.prix_vente_m2.v)}/m²`}
+                  provenance={dossier.prix_m2_dvf ? `Prix de vente : médiane DVF réelle de ${dossier.commune} (${dossier.prix_m2_dvf.n} ventes récentes)` : 'Prix de vente : hypothèse du preset (modifiable)'} />
+                {bil.ca_social > 0 && <Ligne l="Ventes logements sociaux" v={bil.ca_social} indent
+                  formule={`${env.logts_sociaux} logts × surface × prix × (1 − ${pct(jeu.decote_social.v)} décote)`}
+                  provenance="Décote logement social : hypothèse (prix bailleur < prix libre)" />}
+                {bil.ca_parking > 0 && <Ligne l="Ventes parkings" v={bil.ca_parking} indent
+                  formule={`${env.places} places × ${eur(jeu.prix_parking.v)}`}
+                  provenance="Prix parking : hypothèse du preset" />}
+                <Ligne l="Chiffre d'affaires" v={bil.CA} fort
+                  formule="CA = ventes libres + sociales + parkings" />
 
                 <div style={{ height: 14 }} />
-                <Ligne l="Construction" v={bil.travaux} indent neg />
-                {bil.parkings > 0 && <Ligne l="Parkings" v={bil.parkings} indent neg />}
-                {bil.demo > 0 && <Ligne l="Démolition" v={bil.demo} indent neg />}
-                <Ligne l="VRD et aménagements" v={bil.vrd} indent neg />
-                <Ligne l="Maîtrise d'œuvre" v={bil.moe} indent neg />
-                <Ligne l="Assurances" v={bil.assur} indent neg />
-                <Ligne l="Aléas" v={bil.aleas} indent neg />
-                <Ligne l="Honoraires de promotion" v={bil.promo} indent neg />
-                <Ligne l="Commercialisation" v={bil.commerc} indent neg />
-                <Ligne l="Frais financiers" v={bil.finan} indent neg />
-                <Ligne l="Taxe d'aménagement" v={bil.ta} indent neg />
-                <Ligne l="Total des coûts" v={bil.couts} fort neg />
+                <Ligne l="Construction" v={bil.travaux} indent neg
+                  formule={`${num(env.sdp)} m² SDP × ${eur(jeu.cout_travaux_m2.v)}/m²`}
+                  provenance="Coût de construction : hypothèse du preset (à recaler sur vos opérations)" />
+                {bil.parkings > 0 && <Ligne l="Parkings" v={bil.parkings} indent neg
+                  formule={`${env.places} places × ${eur(jeu.cout_parking.v)}`} />}
+                {bil.demo > 0 && <Ligne l="Démolition" v={bil.demo} indent neg
+                  formule={`${num(connue(dossier.bati_existant_m2) ? dossier.bati_existant_m2.val : 0)} m² × ${eur(jeu.cout_demolition_m2.v)}/m²`} />}
+                <Ligne l="VRD et aménagements" v={bil.vrd} indent neg
+                  formule={`Forfait ${eur(jeu.vrd_forfait.v)}`} provenance="Voiries, réseaux, espaces verts : hypothèse forfaitaire" />
+                <Ligne l="Maîtrise d'œuvre" v={bil.moe} indent neg
+                  formule={`${pct(jeu.honoraires_moe.v)} × travaux`} provenance="Architecte, BET, OPC" />
+                <Ligne l="Assurances" v={bil.assur} indent neg
+                  formule={`${pct(jeu.assurances.v)} × travaux`} />
+                <Ligne l="Aléas" v={bil.aleas} indent neg
+                  formule={`${pct(jeu.alea.v)} × travaux`} provenance="Provision pour imprévus" />
+                <Ligne l="Honoraires de promotion" v={bil.promo} indent neg
+                  formule={`${pct(jeu.honoraires_promo.v)} × CA`} />
+                <Ligne l="Commercialisation" v={bil.commerc} indent neg
+                  formule={`${pct(jeu.commercialisation.v)} × CA`} provenance="Commissions et marketing" />
+                <Ligne l="Frais financiers" v={bil.finan} indent neg
+                  formule={`${pct(jeu.frais_financiers.v)} × CA`} provenance="Portage sur la durée d'opération" />
+                <Ligne l="Taxe d'aménagement" v={bil.ta} indent neg
+                  formule={`${num(env.sdp)} m² × ${eur(jeu.taxe_amenagement_m2.v)} × ${pct(jeu.taux_ta.v)}`}
+                  provenance="Taxe d'aménagement : valeur forfaitaire × taux communal + départemental" />
+                <Ligne l="Total des coûts" v={bil.couts} fort neg
+                  formule="Somme de tous les postes de coûts ci-dessus" />
 
                 <div style={{ height: 14 }} />
-                <Ligne l={`Marge cible (${pct(jeu.marge_cible.v)})`} v={bil.marge} fort neg />
+                <Ligne l={`Marge cible (${pct(jeu.marge_cible.v)})`} v={bil.marge} fort neg
+                  formule={`${pct(jeu.marge_cible.v)} × CA`}
+                  provenance="Marge nette visée. Sous ce seuil, l'opération ne se fait pas." />
 
                 <div style={{ marginTop: 18, padding: '16px 18px', background: bil.charge_fonciere > 0 ? 'rgba(75,168,125,.08)' : 'rgba(209,89,106,.08)', border: `1px solid ${bil.charge_fonciere > 0 ? 'rgba(75,168,125,.3)' : 'rgba(209,89,106,.3)'}`, borderRadius: 6 }}>
                   <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-end' }}>
@@ -1438,6 +1636,9 @@ function Fiche({ dossier, regles, jeu, onRegles, onPrix, onRetour, onSave, sauve
                       <div style={{ fontSize: 14, fontWeight: 600 }}>Charge foncière admissible</div>
                       <div className="mono" style={{ fontSize: 11, color: C.txt3, marginTop: 3 }}>
                         {eur(bil.cf_m2_sdp)} / m² SDP · {eur(bil.cf_m2_terrain)} / m² de terrain
+                      </div>
+                      <div style={{ fontSize: 11, color: C.txt3, marginTop: 6, lineHeight: 1.5 }}>
+                        = (CA − coûts − marge) ÷ (1 + {pct(jeu.frais_acquisition.v)} frais d'acquisition)
                       </div>
                     </div>
                     <div className="mono" style={{ fontSize: 26, fontWeight: 700, color: bil.charge_fonciere > 0 ? C.vert : C.rouge, letterSpacing: '-.02em' }}>
@@ -1512,6 +1713,7 @@ function Fiche({ dossier, regles, jeu, onRegles, onPrix, onRetour, onSave, sauve
               ['Prescriptions', dossier.prescriptions.length ? `${dossier.prescriptions.length} relevée(s)` : 'aucune', F.API],
               ['Servitudes', dossier.servitudes.length ? `${dossier.servitudes.length} relevée(s)` : 'aucune', F.API],
               ['Risques', Object.keys(dossier.risques).length ? 'renseignés' : null, Object.keys(dossier.risques).length ? F.API : F.ABSENT],
+              ['Prix de vente (DVF)', dossier.prix_m2_dvf ? `${num(dossier.prix_m2_dvf.median)} €/m² (${dossier.prix_m2_dvf.n} ventes)` : null, dossier.prix_m2_dvf ? F.API : F.ABSENT],
             ].map(([l, v, f]) => (
               <div key={l} className="row" style={{ justifyContent: 'space-between', padding: '8px 0', borderBottom: `1px solid ${C.bord}` }}>
                 <span style={{ fontSize: 12.5, color: C.txt2 }}>{l}</span>
