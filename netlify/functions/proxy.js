@@ -16,6 +16,7 @@ const DOMAINES_AUTORISES = [
   'wxs.ign.fr',
   'data.economie.gouv.fr',
   'api.cquest.org',
+  'app.dvf.etalab.gouv.fr',
 ];
 
 exports.handler = async (event) => {
