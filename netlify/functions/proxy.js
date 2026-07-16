@@ -15,6 +15,7 @@ const DOMAINES_AUTORISES = [
   'data.geopf.fr',
   'wxs.ign.fr',
   'data.economie.gouv.fr',
+  'api.cquest.org',
 ];
 
 exports.handler = async (event) => {
