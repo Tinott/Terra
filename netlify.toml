@@ -1,0 +1,21 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+# Jolis chemins /api/* vers les fonctions serverless
+[[redirects]]
+  from = "/api/proxy"
+  to = "/.netlify/functions/proxy"
+  status = 200
+
+[[redirects]]
+  from = "/api/plu"
+  to = "/.netlify/functions/plu"
+  status = 200
+
+# SPA : tout le reste sert index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
