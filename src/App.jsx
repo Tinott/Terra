@@ -735,6 +735,10 @@ async function collecter(entree, onEtape) {
       d.parcelles = c.features.map((x) => `${x.properties.section}${x.properties.numero}`);
       d.ref = `${f.properties.section}${f.properties.numero}`;
       d.commune = d.commune || f.properties.nom_com || '';
+      // Section au format Etalab DVF : 5 caractères, complété à gauche par des zéros.
+      // Ex. section "BC" → "000BC" ; parfois préfixe commune sur 2 chiffres.
+      const sec = (f.properties.section || '').toUpperCase();
+      if (sec) d.section_dvf = sec.padStart(5, '0');
       const s = f.properties.contenance || surfaceGeom(f.geometry);
       if (s) d.surface_m2 = V(Math.round(s), { unite: 'm²', fiab: F.API, conf: 0.95, source: 'Cadastre PCI (IGN)' });
     } else {
@@ -805,31 +809,53 @@ async function collecter(entree, onEtape) {
     } catch { d.sources_ko.push('Géorisques'); }
   }
 
-  /* Prix de vente réels (DVF) — médiane €/m² des appartements récents de la commune */
-  if (d.code_insee) {
+  /* Prix de vente réels (DVF Etalab) — mutations de la section cadastrale.
+     API officielle : app.dvf.etalab.gouv.fr/api/mutations3/{insee}/{section}
+     On récupère les ventes d'appartements récentes du voisinage immédiat. */
+  if (d.code_insee && d.section_dvf) {
     onEtape?.('Prix de vente réels (DVF)');
-    try {
-      const dvf = await jget(`https://api.cquest.org/dvf?code_commune=${d.code_insee}`);
-      const ventes = (dvf.resultats || dvf.features || dvf || []);
+    // L'API Etalab attend la section sur 5 caractères, mais le format exact
+    // (préfixe) varie. On essaie plusieurs variantes jusqu'à obtenir des mutations.
+    const sec = d.section_dvf.replace(/^0+/, ''); // section nue, ex "BC"
+    const variantes = [
+      d.section_dvf,                 // 000BC
+      sec.padStart(5, '0'),          // 000BC (idem)
+      '0' + sec.padStart(4, '0'),    // 000BC variante
+      sec.padEnd(5, '0'),            // BC000
+      '00' + sec.padEnd(3, '0'),     // 00BC0
+    ];
+    let muts = null;
+    for (const v of [...new Set(variantes)]) {
+      try {
+        const dvf = await jget(`https://app.dvf.etalab.gouv.fr/api/mutations3/${d.code_insee}/${v}`);
+        if (dvf.mutations && dvf.mutations.length) { muts = dvf.mutations; break; }
+      } catch { /* variante suivante */ }
+    }
+    if (muts) {
       const prixM2 = [];
-      const arr = Array.isArray(ventes) ? ventes : (ventes.resultats || []);
-      arr.forEach((v) => {
-        const p = v.valeur_fonciere ?? v.properties?.valeur_fonciere;
-        const s = v.surface_relle_bati ?? v.surface_reelle_bati ?? v.properties?.surface_reelle_bati;
-        const type = (v.type_local ?? v.properties?.type_local ?? '').toLowerCase();
-        if (p && s && s > 15 && s < 300 && /appart/.test(type)) {
+      muts.forEach((m) => {
+        const type = (m.type_local || '');
+        const nat = (m.nature_mutation || '');
+        const p = parseFloat(m.valeur_fonciere);
+        const s = parseFloat(m.surface_reelle_bati);
+        if (/Appartement|Maison/.test(type) && /Vente/.test(nat) && p > 0 && s > 15 && s < 300) {
           const r = p / s;
           if (r > 500 && r < 25000) prixM2.push(r);
         }
       });
-      if (prixM2.length >= 5) {
+      if (prixM2.length >= 3) {
         prixM2.sort((a, b) => a - b);
-        const med = prixM2[Math.floor(prixM2.length / 2)];
-        const p25 = prixM2[Math.floor(prixM2.length * 0.25)];
-        const p75 = prixM2[Math.floor(prixM2.length * 0.75)];
-        d.prix_m2_dvf = { median: Math.round(med), p25: Math.round(p25), p75: Math.round(p75), n: prixM2.length };
+        const q = (f) => prixM2[Math.min(prixM2.length - 1, Math.floor(f * prixM2.length))];
+        d.prix_m2_dvf = { median: Math.round(q(0.5)), p25: Math.round(q(0.25)), p75: Math.round(q(0.75)), n: prixM2.length, echelle: 'section' };
+      } else if (prixM2.length > 0) {
+        const moy = prixM2.reduce((a, b) => a + b, 0) / prixM2.length;
+        d.prix_m2_dvf = { median: Math.round(moy), p25: Math.round(moy * 0.85), p75: Math.round(moy * 1.15), n: prixM2.length, echelle: 'section (peu de ventes)' };
+      } else {
+        d.sources_ko.push('DVF — pas de vente exploitable');
       }
-    } catch { d.sources_ko.push('DVF'); }
+    } else {
+      d.sources_ko.push('DVF');
+    }
   }
 
   onEtape?.(null);
@@ -1713,7 +1739,7 @@ function Fiche({ dossier, regles, jeu, onRegles, onPrix, onRetour, onSave, sauve
               ['Prescriptions', dossier.prescriptions.length ? `${dossier.prescriptions.length} relevée(s)` : 'aucune', F.API],
               ['Servitudes', dossier.servitudes.length ? `${dossier.servitudes.length} relevée(s)` : 'aucune', F.API],
               ['Risques', Object.keys(dossier.risques).length ? 'renseignés' : null, Object.keys(dossier.risques).length ? F.API : F.ABSENT],
-              ['Prix de vente (DVF)', dossier.prix_m2_dvf ? `${num(dossier.prix_m2_dvf.median)} €/m² (${dossier.prix_m2_dvf.n} ventes)` : null, dossier.prix_m2_dvf ? F.API : F.ABSENT],
+              ['Prix de vente (DVF)', dossier.prix_m2_dvf ? `${num(dossier.prix_m2_dvf.median)} €/m² (${dossier.prix_m2_dvf.n} ventes, ${dossier.prix_m2_dvf.echelle})` : null, dossier.prix_m2_dvf ? F.API : F.ABSENT],
             ].map(([l, v, f]) => (
               <div key={l} className="row" style={{ justifyContent: 'space-between', padding: '8px 0', borderBottom: `1px solid ${C.bord}` }}>
                 <span style={{ fontSize: 12.5, color: C.txt2 }}>{l}</span>
